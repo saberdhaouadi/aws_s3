@@ -1,0 +1,107 @@
+import boto3
+import botocore.exceptions
+from datetime import datetime
+
+# List of AWS account IDs and corresponding role ARNs for cross-account access
+aws_accounts = [
+    {
+        'account_id': '123456789012',
+        'role_arn': 'arn:aws:iam::123456789012:role/CrossAccountRole',
+        'region': 'us-east-1'
+    },
+    {
+        'account_id': '987654321098',
+        'role_arn': 'arn:aws:iam::987654321098:role/CrossAccountRole',
+        'region': 'us-west-2'
+    }
+    # Add more accounts as needed
+]
+
+def assume_role(account_id, role_arn):
+    """Assume a role in the target AWS account."""
+    try:
+        sts_client = boto3.client('sts')
+        response = sts_client.assume_role(
+            RoleArn=role_arn,
+            RoleSessionName=f'Session_{account_id}'
+        )
+        credentials = response['Credentials']
+        return credentials
+    except botocore.exceptions.ClientError as e:
+        print(f"Failed to assume role for account {account_id}: {e}")
+        return None
+
+def get_ssm_maintenance_windows(credentials, region):
+    """Retrieve SSM Maintenance Windows that may include EC2 reboots."""
+    try:
+        ssm_client = boto3.client(
+            'ssm',
+            region_name=region,
+            aws_access_key_id=credentials['AccessKeyId'],
+            aws_secret_access_key=credentials['SecretAccessKey'],
+            aws_session_token=credentials['SessionToken']
+        )
+        
+        response = ssm_client.describe_maintenance_windows()
+        maintenance_windows = response.get('WindowIdentities', [])
+        
+        scheduled_reboots = []
+        for window in maintenance_windows:
+            window_id = window['WindowId']
+            window_name = window.get('Name', 'N/A')
+            schedule = window.get('Schedule', 'N/A')
+            enabled = window.get('Enabled', True)
+            
+            # Get tasks associated with the maintenance window
+            tasks_response = ssm_client.describe_maintenance_window_tasks(WindowId=window_id)
+            for task in tasks_response.get('Tasks', []):
+                task_type = task.get('TaskType', 'N/A')
+                task_params = task.get('TaskParameters', {})
+                
+                # Check if task involves reboot (e.g., RunCommand with reboot-related commands)
+                if task_type == 'RUN_COMMAND':
+                    command_id = task_params.get('CommandId', {}).get('Value', 'N/A')
+                    if 'reboot' in str(task_params).lower():
+                        scheduled_reboots.append({
+                            'WindowId': window_id,
+                            'WindowName': window_name,
+                            'Schedule': schedule,
+                            'TaskType': task_type,
+                            'Enabled': enabled
+                        })
+        
+        return scheduled_reboots
+    except botocore.exceptions.ClientError as e:
+        print(f"Error retrieving SSM Maintenance Windows: {e}")
+        return []
+
+def check_scheduled_reboots():
+    """Check for scheduled EC2 reboots across multiple AWS accounts."""
+    for account in aws_accounts:
+        account_id = account['account_id']
+        role_arn = account['role_arn']
+        region = account['region']
+        
+        print(f"\nChecking account: {account_id} in region: {region}")
+        
+        # Assume role in the target account
+        credentials = assume_role(account_id, role_arn)
+        if not credentials:
+            continue
+        
+        # Check SSM Maintenance Windows for reboot schedules
+        scheduled_reboots = get_ssm_maintenance_windows(credentials, region)
+        
+        if scheduled_reboots:
+            print(f"Found {len(scheduled_reboots)} scheduled reboot(s) in account {account_id}:")
+            for reboot in scheduled_reboots:
+                print(f" - Window ID: {reboot['WindowId']}")
+                print(f"   Window Name: {reboot['WindowName']}")
+                print(f"   Schedule: {reboot['Schedule']}")
+                print(f"   Task Type: {reboot['TaskType']}")
+                print(f"   Enabled: {reboot['Enabled']}")
+        else:
+            print(f"No scheduled reboots found in account {account_id}.")
+
+if __name__ == "__main__":
+    check_scheduled_reboots()
